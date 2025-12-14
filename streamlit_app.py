@@ -9,14 +9,14 @@ import tempfile
 import os
 import streamlit.components.v1 as components
 import time
+
+# --- FIX 1: PREVENT APP FREEZE ---
 import nest_asyncio
+nest_asyncio.apply()
 
 # ==========================================
 # 0. CONFIGURATION & SETUP
 # ==========================================
-# Fix for the "nest_asyncio" error in Streamlit Cloud
-nest_asyncio.apply()
-
 st.set_page_config(layout="wide", page_title="Drill Hole Visualizer Pro")
 pv.set_plot_theme("document")
 
@@ -88,7 +88,7 @@ default_assays_dict = {
 st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
-# Default to UTM Zone 35S (EPSG:32735)
+# Default to UTM Zone 35S (EPSG:32735) - Common for your area
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
 
 st.sidebar.markdown("---")
@@ -174,54 +174,45 @@ if st.button("Generate 3D Model", type="primary"):
                 # --- 1. LOAD DEM ---
                 dem_ds = rioxarray.open_rasterio(dem_path, masked=True).squeeze()
                 
-                # --- FIX 1: FORCE WGS84 IF MISSING CRS ---
-                # This ensures the code knows the input is Lat/Lon before converting to UTM
+                # --- FIX 2: FORCE WGS84 & REPROJECT ---
                 if dem_ds.rio.crs is None:
                      dem_ds.rio.write_crs("EPSG:4326", inplace=True)
 
-                # --- FIX 2: REPROJECT TO PROJECT CRS (UTM) ---
                 if str(dem_ds.rio.crs) != TARGET_CRS:
                     try:
                         dem_ds = dem_ds.rio.reproject(TARGET_CRS)
                     except Exception as e:
                         st.warning(f"Reprojection warning: {e}. Using original CRS.")
 
-                # --- 3. SAFE CLIPPING ---
+                # --- FIX 3: SAFE CLIPPING ---
                 min_x, max_x = df_collars['X'].min() - BUFFER_SIZE, df_collars['X'].max() + BUFFER_SIZE
                 min_y, max_y = df_collars['Y'].min() - BUFFER_SIZE, df_collars['Y'].max() + BUFFER_SIZE
                 
                 try:
                     dem_clip = dem_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
                 except Exception as clip_err:
-                    st.warning(f"Could not clip to drill area (bounds mismatch). Using full map instead.")
-                    dem_clip = dem_ds  # Fallback: Use the whole map instead of crashing
+                    st.warning(f"Could not clip to drill area (bounds mismatch?). Using full map. Error: {clip_err}")
+                    dem_clip = dem_ds
 
-                # --- 4. SATELLITE PROCESSING ---
+                # --- 4. SATELLITE ---
                 sat_ds = rioxarray.open_rasterio(sat_path, masked=True)
-                
-                # Force WGS84 for Satellite too if missing
                 if sat_ds.rio.crs is None:
                     sat_ds.rio.write_crs("EPSG:4326", inplace=True)
 
                 if str(sat_ds.rio.crs) != TARGET_CRS:
-                    try:
-                        sat_ds = sat_ds.rio.reproject(TARGET_CRS)
+                    try: sat_ds = sat_ds.rio.reproject(TARGET_CRS)
                     except: pass
                 
-                # Try clipping satellite to match DEM bounds
-                try:
-                    sat_clip = sat_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
-                except:
-                    sat_clip = sat_ds
+                try: sat_clip = sat_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
+                except: sat_clip = sat_ds
 
-                # Texture Processing
+                # Texture
                 sat_data = sat_clip.values.transpose(1, 2, 0)
-                # Normalize to 0-255 uint8
                 if sat_data.dtype != np.uint8:
                     sat_data = ((sat_data - np.nanmin(sat_data)) / (np.nanmax(sat_data) - np.nanmin(sat_data)) * 255).astype(np.uint8)
                 terrain_tex = pv.Texture(sat_data)
                 
-                # Mesh Gen
+                # Mesh
                 x = dem_clip.x.values - CENTER_X
                 y = dem_clip.y.values - CENTER_Y
                 z = dem_clip.values
@@ -242,7 +233,7 @@ if st.button("Generate 3D Model", type="primary"):
                 dem_ds.close()
                 sat_ds.close()
 
-            # 4. PLOTTING
+            # PLOTTING
             plotter = pv.Plotter(window_size=[800, 600])
             plotter.set_background('white')
             
@@ -253,13 +244,11 @@ if st.button("Generate 3D Model", type="primary"):
                 plotter.add_mesh(plane, color="gray", opacity=0.5, show_edges=True)
             
             for _, row in df_collars.iterrows():
-                # Get local Z if interpolator exists
                 z_local = avg_elev
                 if z_interpolator:
                     try: z_local = z_interpolator((row['Y'], row['X']))
                     except: pass
                 
-                # Set Z_rel for this hole
                 row['Z_rel'] = float((z_local - avg_elev) * V_EXAG) + 2.0
                 
                 start = get_coords_at_depth(row, 0, V_EXAG, CENTER_X, CENTER_Y)
@@ -269,7 +258,6 @@ if st.button("Generate 3D Model", type="primary"):
                 plotter.add_mesh(pv.Line(start, end).tube(radius=DEFAULT_TUBE_RADIUS), color="lightgrey", opacity=0.5)
                 plotter.add_point_labels([start + [0,0,120]], [str(row['HoleID'])], font_size=16, text_color="black", always_visible=True, shape_opacity=0.5)
 
-                # Assays
                 if not df_assays.empty and 'Grade' in df_assays.columns:
                     hole_assays = df_assays[df_assays['HoleID'] == row['HoleID']]
                     for _, a_row in hole_assays.iterrows():
