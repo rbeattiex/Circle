@@ -1,5 +1,8 @@
 streamlit
 pyvista
+trame
+trame-vuetify
+trame-vtk
 pandas
 numpy
 rioxarray
