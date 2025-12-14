@@ -9,9 +9,10 @@ import tempfile
 import os
 import streamlit.components.v1 as components
 import time
-
-# --- FIX 1: PREVENT APP FREEZE ---
+from concurrent.futures import ThreadPoolExecutor # NEW: Required for threading fix
 import nest_asyncio
+
+# Apply the asyncio patch just in case, though threading does the heavy lifting
 nest_asyncio.apply()
 
 # ==========================================
@@ -44,6 +45,13 @@ def safe_remove_file(path):
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
+
+# --- NEW: Threaded Export Wrapper ---
+# This runs the export in a separate thread to prevent the "RuntimeError" loop crash
+def export_html_threaded(plotter, filename):
+    with ThreadPoolExecutor() as executor:
+        future = executor.submit(plotter.export_html, filename)
+        return future.result()
 
 def get_coords_at_depth(row, depth, v_exag, center_x, center_y, z_datum=0):
     az_rad = math.radians(row['Azimuth'])
@@ -88,7 +96,7 @@ default_assays_dict = {
 st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
-# Default to UTM Zone 35S (EPSG:32735) - Common for your area
+# Default to UTM Zone 35S (EPSG:32735)
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
 
 st.sidebar.markdown("---")
@@ -174,7 +182,7 @@ if st.button("Generate 3D Model", type="primary"):
                 # --- 1. LOAD DEM ---
                 dem_ds = rioxarray.open_rasterio(dem_path, masked=True).squeeze()
                 
-                # --- FIX 2: FORCE WGS84 & REPROJECT ---
+                # --- FIX: FORCE WGS84 & REPROJECT ---
                 if dem_ds.rio.crs is None:
                      dem_ds.rio.write_crs("EPSG:4326", inplace=True)
 
@@ -184,17 +192,17 @@ if st.button("Generate 3D Model", type="primary"):
                     except Exception as e:
                         st.warning(f"Reprojection warning: {e}. Using original CRS.")
 
-                # --- FIX 3: SAFE CLIPPING ---
+                # --- SAFE CLIPPING ---
                 min_x, max_x = df_collars['X'].min() - BUFFER_SIZE, df_collars['X'].max() + BUFFER_SIZE
                 min_y, max_y = df_collars['Y'].min() - BUFFER_SIZE, df_collars['Y'].max() + BUFFER_SIZE
                 
                 try:
                     dem_clip = dem_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
                 except Exception as clip_err:
-                    st.warning(f"Could not clip to drill area (bounds mismatch?). Using full map. Error: {clip_err}")
+                    st.warning(f"Clipping warning (might be no overlap?): {clip_err}")
                     dem_clip = dem_ds
 
-                # --- 4. SATELLITE ---
+                # --- 2. SATELLITE PROCESSING ---
                 sat_ds = rioxarray.open_rasterio(sat_path, masked=True)
                 if sat_ds.rio.crs is None:
                     sat_ds.rio.write_crs("EPSG:4326", inplace=True)
@@ -206,13 +214,13 @@ if st.button("Generate 3D Model", type="primary"):
                 try: sat_clip = sat_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
                 except: sat_clip = sat_ds
 
-                # Texture
+                # Texture Processing
                 sat_data = sat_clip.values.transpose(1, 2, 0)
                 if sat_data.dtype != np.uint8:
                     sat_data = ((sat_data - np.nanmin(sat_data)) / (np.nanmax(sat_data) - np.nanmin(sat_data)) * 255).astype(np.uint8)
                 terrain_tex = pv.Texture(sat_data)
                 
-                # Mesh
+                # Mesh Gen
                 x = dem_clip.x.values - CENTER_X
                 y = dem_clip.y.values - CENTER_Y
                 z = dem_clip.values
@@ -268,7 +276,8 @@ if st.button("Generate 3D Model", type="primary"):
             plotter.show_grid(xtitle="East", ytitle="North", ztitle="Depth")
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_html:
-                plotter.export_html(tmp_html.name)
+                # --- FIX: Run Export in Thread to Avoid Loop Conflict ---
+                export_html_threaded(plotter, tmp_html.name)
                 html_path = tmp_html.name
 
             with open(html_path, 'r') as f: html_content = f.read()
