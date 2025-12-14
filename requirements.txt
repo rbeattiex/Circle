@@ -4,6 +4,5 @@ pandas
 numpy
 rioxarray
 scipy
-vtk-osmesa
 xarray
 openpyxl
