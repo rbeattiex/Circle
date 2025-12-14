@@ -9,10 +9,14 @@ import tempfile
 import os
 import streamlit.components.v1 as components
 import time
+import nest_asyncio
 
 # ==========================================
 # 0. CONFIGURATION & SETUP
 # ==========================================
+# Fix for the "nest_asyncio" error in Streamlit Cloud
+nest_asyncio.apply()
+
 st.set_page_config(layout="wide", page_title="Drill Hole Visualizer Pro")
 pv.set_plot_theme("document")
 
@@ -84,7 +88,7 @@ default_assays_dict = {
 st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
-# NEW: Allow user to define CRS, default to UTM Zone 35S
+# Default to UTM Zone 35S (EPSG:32735)
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
 
 st.sidebar.markdown("---")
@@ -143,7 +147,7 @@ if st.button("Generate 3D Model", type="primary"):
         st.error("Collar data is required.")
         st.stop()
         
-    with st.spinner("Processing... (Reprojecting maps to match drill holes)"):
+    with st.spinner("Processing... (Aligning Maps & Generating 3D Mesh)"):
         # Prep Data
         df_collars = edited_collars.copy()
         df_assays = edited_assays.copy()
@@ -170,27 +174,41 @@ if st.button("Generate 3D Model", type="primary"):
                 # --- 1. LOAD DEM ---
                 dem_ds = rioxarray.open_rasterio(dem_path, masked=True).squeeze()
                 
-                # --- FIX: REPROJECT DEM TO UTM BEFORE CLIPPING ---
-                # Check if we need to reproject (e.g. if CRS is LatLon but we need UTM)
-                if dem_ds.rio.crs != TARGET_CRS:
-                    dem_ds = dem_ds.rio.reproject(TARGET_CRS)
+                # --- FIX 1: FORCE WGS84 IF MISSING CRS ---
+                # This ensures the code knows the input is Lat/Lon before converting to UTM
+                if dem_ds.rio.crs is None:
+                     dem_ds.rio.write_crs("EPSG:4326", inplace=True)
 
-                # --- 2. CLIP DEM ---
+                # --- FIX 2: REPROJECT TO PROJECT CRS (UTM) ---
+                if str(dem_ds.rio.crs) != TARGET_CRS:
+                    try:
+                        dem_ds = dem_ds.rio.reproject(TARGET_CRS)
+                    except Exception as e:
+                        st.warning(f"Reprojection warning: {e}. Using original CRS.")
+
+                # --- 3. SAFE CLIPPING ---
                 min_x, max_x = df_collars['X'].min() - BUFFER_SIZE, df_collars['X'].max() + BUFFER_SIZE
                 min_y, max_y = df_collars['Y'].min() - BUFFER_SIZE, df_collars['Y'].max() + BUFFER_SIZE
                 
                 try:
                     dem_clip = dem_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
                 except Exception as clip_err:
-                    st.warning(f"Clipping warning (might be no overlap?): {clip_err}")
-                    # Fallback: Just use the whole reprojected DEM if clip fails
-                    dem_clip = dem_ds
+                    st.warning(f"Could not clip to drill area (bounds mismatch). Using full map instead.")
+                    dem_clip = dem_ds  # Fallback: Use the whole map instead of crashing
 
-                # --- 3. LOAD & REPROJECT SATELLITE ---
+                # --- 4. SATELLITE PROCESSING ---
                 sat_ds = rioxarray.open_rasterio(sat_path, masked=True)
-                if sat_ds.rio.crs != TARGET_CRS:
-                    sat_ds = sat_ds.rio.reproject(TARGET_CRS)
                 
+                # Force WGS84 for Satellite too if missing
+                if sat_ds.rio.crs is None:
+                    sat_ds.rio.write_crs("EPSG:4326", inplace=True)
+
+                if str(sat_ds.rio.crs) != TARGET_CRS:
+                    try:
+                        sat_ds = sat_ds.rio.reproject(TARGET_CRS)
+                    except: pass
+                
+                # Try clipping satellite to match DEM bounds
                 try:
                     sat_clip = sat_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
                 except:
