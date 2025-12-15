@@ -14,7 +14,8 @@ st.set_page_config(layout="wide", page_title="Drill Hole Visualizer Pro")
 
 # Default Constants
 DEFAULT_V_EXAG = 5
-DEFAULT_WIDTH_EXAG = 1.0 # New Default
+DEFAULT_WIDTH_EXAG = 1.0 
+DEFAULT_MIN_SCALE = 1.5 # New default for mineralization pop
 DEFAULT_BUFFER = 1000
 
 # ==========================================
@@ -52,7 +53,7 @@ def get_dynamic_color(grade, rules):
             return rule['color']
     return "lightgray" # Default for low grade
 
-def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str, width_exag):
+def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str, width_exag, min_scale):
     # Parse Arguments
     show_grid = (show_grid_str == "True")
     
@@ -60,10 +61,12 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
     BASE_COLLAR_R = 40.0
     BASE_TRACE_R = 12.0
     
-    # Apply Multiplier
+    # Apply General Multiplier
     eff_collar_r = BASE_COLLAR_R * width_exag
     eff_trace_r = BASE_TRACE_R * width_exag
-    eff_assay_r = eff_trace_r * 1.15  # Assays slightly thicker than trace
+    
+    # Apply Mineralization Specific Multiplier (relative to trace)
+    eff_assay_r = eff_trace_r * min_scale
 
     # 1. Load Data
     try:
@@ -212,8 +215,8 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
     plotter.export_html(html_out_path)
 
 if __name__ == "__main__":
-    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json, show_grid, width_exag
-    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9], sys.argv[10], float(sys.argv[11]))
+    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json, show_grid, width_exag, min_scale
+    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9], sys.argv[10], float(sys.argv[11]), float(sys.argv[12]))
 """
 
 # ==========================================
@@ -237,8 +240,8 @@ EMPTY_ASSAYS = pd.DataFrame(columns=['HoleID', 'From', 'To', 'Grade'])
 # ==========================================
 st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
-# NEW: Width Exaggeration Slider
-WIDTH_EXAG = st.sidebar.slider("Hole Width Exaggeration", 0.1, 5.0, DEFAULT_WIDTH_EXAG, 0.1)
+WIDTH_EXAG = st.sidebar.slider("General Hole Width", 0.1, 5.0, DEFAULT_WIDTH_EXAG, 0.1)
+MIN_SCALE = st.sidebar.slider("Mineralization Scale (Multiplier)", 1.0, 5.0, DEFAULT_MIN_SCALE, 0.1, help="Makes colored assay intervals thicker than the drill trace.")
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
 SHOW_GRID = st.sidebar.checkbox("Show Grid & Axes", value=True)
@@ -283,15 +286,8 @@ with tab_assays:
 
 # --- TAB 3: DYNAMIC COLORS ---
 with tab_colors:
-    c_header, c_btn = st.columns([4, 1])
-    with c_header:
-        st.markdown("#### Grade Thresholds")
-    with c_btn:
-        # NEW: Sort Button
-        if st.button("⬇️ Sort by Grade"):
-            st.session_state.grade_rules.sort(key=lambda x: x['cutoff'], reverse=True)
-            st.rerun()
-
+    st.markdown("#### Grade Thresholds")
+    
     if 'grade_rules' not in st.session_state:
         st.session_state.grade_rules = [
             {'cutoff': 0.50, 'color': '#FF0000', 'label': 'High Grade'},
@@ -310,6 +306,7 @@ with tab_colors:
     for i, rule in enumerate(st.session_state.grade_rules):
         c1, c2, c3, c4 = st.columns([2, 1, 3, 1])
         with c1: 
+            # Note: We assign logic immediately so values persist
             rule['cutoff'] = st.number_input(f"Cutoff {i}", value=float(rule['cutoff']), key=f"cut_{i}", label_visibility="collapsed")
         with c2: 
             rule['color'] = st.color_picker(f"Color {i}", value=rule['color'], key=f"col_{i}", label_visibility="collapsed")
@@ -324,9 +321,17 @@ with tab_colors:
             st.session_state.grade_rules.pop(i)
         st.rerun()
 
-    if st.button("➕ Add Threshold"):
-        st.session_state.grade_rules.append({'cutoff': 0.0, 'color': '#808080', 'label': 'New Rule'})
-        st.rerun()
+    c_add, c_sort = st.columns([1, 4])
+    with c_add:
+        if st.button("➕ Add Rule"):
+            st.session_state.grade_rules.append({'cutoff': 0.0, 'color': '#808080', 'label': 'New Rule'})
+            st.rerun()
+    with c_sort:
+        # MOVED BUTTON HERE: Processing runs top-to-bottom. 
+        # By placing this after the loop, we ensure the latest numbers are captured before sorting.
+        if st.button("⬇️ Sort by Grade (High to Low)"):
+            st.session_state.grade_rules.sort(key=lambda x: x['cutoff'], reverse=True)
+            st.rerun()
 
 # ==========================================
 # 5. EXECUTION LOGIC
@@ -359,12 +364,12 @@ if st.button("Generate 3D Model", type="primary"):
         with open(p_script, "w") as f:
             f.write(RENDER_SCRIPT)
             
-        # Passing new argument: WIDTH_EXAG
+        # Updated Command to include MIN_SCALE
         cmd = [
             sys.executable, p_script,
             p_dem, p_sat, p_collars, p_assays, p_html,
             str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS, p_colors,
-            str(SHOW_GRID), str(WIDTH_EXAG)
+            str(SHOW_GRID), str(WIDTH_EXAG), str(MIN_SCALE)
         ]
         
         try:
