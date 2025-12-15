@@ -51,7 +51,10 @@ def get_dynamic_color(grade, rules):
             return rule['color']
     return "lightgray" # Default for low grade
 
-def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path):
+def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str):
+    # Parse Boolean
+    show_grid = (show_grid_str == "True")
+
     # 1. Load Data
     try:
         df_collars = pd.read_csv(collars_path)
@@ -156,9 +159,7 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
 
     # Traces
     for _, row in df_collars.iterrows():
-        # Skip if missing basic data
-        if pd.isna(row['X']) or pd.isna(row['Y']) or pd.isna(row['Depth']):
-            continue
+        if pd.isna(row['X']) or pd.isna(row['Y']) or pd.isna(row['Depth']): continue
 
         z_local = avg_elev
         if z_interpolator:
@@ -185,12 +186,25 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
                 
                 c_val = get_dynamic_color(a_row['Grade'], color_rules)
                 plotter.add_mesh(pv.Line(s, e).tube(radius=14), color=c_val)
+    
+    # 5. Add Legend
+    # Convert color rules to PyVista legend entries: (Label, Color)
+    legend_entries = []
+    for rule in color_rules:
+        legend_entries.append((rule['label'], rule['color']))
+    
+    if legend_entries:
+        plotter.add_legend(labels=legend_entries, bcolor='white', size=[0.2, 0.2])
 
-    plotter.show_grid(xtitle="East", ytitle="North", ztitle="Depth")
+    # 6. Grid
+    if show_grid:
+        plotter.show_grid(xtitle="East", ytitle="North", ztitle="Depth")
+
     plotter.export_html(html_out_path)
 
 if __name__ == "__main__":
-    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9])
+    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json, show_grid
+    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9], sys.argv[10])
 """
 
 # ==========================================
@@ -206,7 +220,6 @@ def save_uploaded_file(uploaded_file):
 # ==========================================
 # 3. EMPTY TEMPLATES
 # ==========================================
-# No default data. Just structure.
 EMPTY_COLLARS = pd.DataFrame(columns=['HoleID', 'X', 'Y', 'Azimuth', 'Dip', 'Depth'])
 EMPTY_ASSAYS = pd.DataFrame(columns=['HoleID', 'From', 'To', 'Grade'])
 
@@ -217,6 +230,7 @@ st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
+SHOW_GRID = st.sidebar.checkbox("Show Grid & Axes", value=True)  # <-- NEW CHECKBOX
 
 st.sidebar.markdown("---")
 st.sidebar.header("2. Terrain Upload")
@@ -231,7 +245,6 @@ tab_collars, tab_assays, tab_colors = st.tabs(["1. Drill Collars", "2. Assay Int
 with tab_collars:
     collar_file = st.file_uploader("Upload Collars", type=["csv", "xlsx"], key="c_up")
     
-    # Logic: Switch between File Data and Empty Template
     if collar_file:
         if collar_file.name.endswith('.csv'): df_collars_in = pd.read_csv(collar_file)
         else: df_collars_in = pd.read_excel(collar_file)
@@ -301,7 +314,6 @@ with tab_colors:
 # 5. EXECUTION LOGIC
 # ==========================================
 if st.button("Generate 3D Model", type="primary"):
-    # Check if table is effectively empty (only headers, no rows)
     if edited_collars.empty:
         st.error("⚠️ **Missing Data:** Please add at least one Drill Collar before generating the model.")
         st.stop()
@@ -315,7 +327,6 @@ if st.button("Generate 3D Model", type="primary"):
         p_html = os.path.join(t_dir, "output_model.html")
         p_script = os.path.join(t_dir, "renderer.py")
         
-        # Save Edited Data
         edited_collars.to_csv(p_collars, index=False)
         edited_assays.to_csv(p_assays, index=False)
         
@@ -330,10 +341,12 @@ if st.button("Generate 3D Model", type="primary"):
         with open(p_script, "w") as f:
             f.write(RENDER_SCRIPT)
             
+        # Passing new argument: SHOW_GRID (True/False as string)
         cmd = [
             sys.executable, p_script,
             p_dem, p_sat, p_collars, p_assays, p_html,
-            str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS, p_colors
+            str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS, p_colors,
+            str(SHOW_GRID)
         ]
         
         try:
