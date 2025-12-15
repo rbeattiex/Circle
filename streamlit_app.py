@@ -4,6 +4,7 @@ import tempfile
 import os
 import sys
 import subprocess
+import json
 import streamlit.components.v1 as components
 
 # ==========================================
@@ -18,7 +19,6 @@ DEFAULT_BUFFER = 1000
 # ==========================================
 # 1. THE WORKER SCRIPT (Runs in separate process)
 # ==========================================
-# This script handles all 3D logic in isolation to prevent Async/Loop crashes.
 RENDER_SCRIPT = """
 import sys
 import os
@@ -28,6 +28,7 @@ import pyvista as pv
 import rioxarray
 from scipy.interpolate import RegularGridInterpolator
 import math
+import json
 
 # Force off-screen rendering
 pv.set_plot_theme("document")
@@ -43,19 +44,27 @@ def get_coords_at_depth(row, depth, v_exag, center_x, center_y, z_datum=0):
     z = row['Z_rel'] + (vertical_drop * v_exag)
     return np.array([x, y, z])
 
-def get_grade_color(grade):
-    if grade >= 0.50: return "red"
-    elif grade >= 0.30: return "darkorange"
-    elif grade >= 0.15: return "yellow"
-    elif grade >= 0.05: return "green"
-    else: return "lightgray"
+def get_dynamic_color(grade, rules):
+    # Rules must be sorted descending by cutoff
+    for rule in rules:
+        if grade >= rule['cutoff']:
+            return rule['color']
+    return "lightgray" # Default for low grade
 
-def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs):
+def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path):
     # 1. Load Data
     df_collars = pd.read_csv(collars_path)
     df_assays = pd.DataFrame()
     if assays_path and assays_path != 'None':
         df_assays = pd.read_csv(assays_path)
+    
+    # Load Color Rules
+    color_rules = []
+    if os.path.exists(colors_json_path):
+        with open(colors_json_path, 'r') as f:
+            color_rules = json.load(f)
+    # Sort rules by cutoff descending to ensure correct evaluation order
+    color_rules.sort(key=lambda x: x['cutoff'], reverse=True)
     
     # 2. Geometry Prep
     CENTER_X = df_collars['X'].mean()
@@ -156,14 +165,17 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
             for _, a_row in hole_assays.iterrows():
                 s = get_coords_at_depth(row, a_row['From'], v_exag, CENTER_X, CENTER_Y)
                 e = get_coords_at_depth(row, a_row['To'], v_exag, CENTER_X, CENTER_Y)
-                plotter.add_mesh(pv.Line(s, e).tube(radius=14), color=get_grade_color(a_row['Grade']))
+                
+                # Use dynamic color logic
+                c_val = get_dynamic_color(a_row['Grade'], color_rules)
+                plotter.add_mesh(pv.Line(s, e).tube(radius=14), color=c_val)
 
     plotter.show_grid(xtitle="East", ytitle="North", ztitle="Depth")
     plotter.export_html(html_out_path)
 
 if __name__ == "__main__":
-    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs
-    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8])
+    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json
+    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9])
 """
 
 # ==========================================
@@ -210,22 +222,74 @@ st.sidebar.header("2. Terrain Upload")
 dem_file = st.sidebar.file_uploader("Upload DEM (.tif)", type=["tif", "tiff"])
 sat_file = st.sidebar.file_uploader("Upload Satellite (.tif)", type=["tif", "tiff"])
 
-st.title("3D Drill Hole Visualizer (Subprocess Mode)")
+st.title("3D Drill Hole Visualizer (Process Isolated)")
+st.info("Using Subprocess Rendering to prevent Async conflicts.")
 
-tab_collars, tab_assays, tab_info = st.tabs(["1. Drill Collars", "2. Assay Intervals", "3. Legend"])
+tab_collars, tab_assays, tab_colors = st.tabs(["1. Drill Collars", "2. Assay Intervals", "3. Grade Colours"])
 
 with tab_collars:
     collar_file = st.file_uploader("Upload Collars", type=["csv", "xlsx"], key="c_up")
-    df_collars_in = pd.read_csv(collar_file) if collar_file else pd.DataFrame(default_collars_dict)
+    if collar_file:
+        if collar_file.name.endswith('.csv'): df_collars_in = pd.read_csv(collar_file)
+        else: df_collars_in = pd.read_excel(collar_file)
+    else:
+        df_collars_in = pd.DataFrame(default_collars_dict)
     edited_collars = st.data_editor(df_collars_in, num_rows="dynamic", key="c_ed", use_container_width=True)
 
 with tab_assays:
     assay_file = st.file_uploader("Upload Assays", type=["csv", "xlsx"], key="a_up")
-    df_assays_in = pd.read_csv(assay_file) if assay_file else pd.DataFrame(default_assays_dict)
+    if assay_file:
+        if assay_file.name.endswith('.csv'): df_assays_in = pd.read_csv(assay_file)
+        else: df_assays_in = pd.read_excel(assay_file)
+    else:
+        df_assays_in = pd.DataFrame(default_assays_dict)
     edited_assays = st.data_editor(df_assays_in, num_rows="dynamic", key="a_ed", use_container_width=True)
 
-with tab_info:
-    st.markdown("- <span style='color:red'>■</span> **Red**: >= 0.50 | <span style='color:darkorange'>■</span> **Orange**: >= 0.30", unsafe_allow_html=True)
+# --- TAB 3: DYNAMIC COLORS ---
+with tab_colors:
+    st.markdown("#### Grade Thresholds")
+    st.caption("Assays will check these rules from top to bottom. First match wins.")
+    
+    # Initialize session state for colors if missing
+    if 'grade_rules' not in st.session_state:
+        st.session_state.grade_rules = [
+            {'cutoff': 0.50, 'color': '#FF0000', 'label': 'High Grade'},  # Red
+            {'cutoff': 0.30, 'color': '#FFA500', 'label': 'Med-High'},    # Orange
+            {'cutoff': 0.15, 'color': '#FFFF00', 'label': 'Med Grade'},   # Yellow
+            {'cutoff': 0.05, 'color': '#008000', 'label': 'Low Grade'}    # Green
+        ]
+
+    # Display Rule Editor
+    rules_to_remove = []
+    
+    # Header
+    h1, h2, h3, h4 = st.columns([2, 1, 3, 1])
+    h1.markdown("**Grade >=**")
+    h2.markdown("**Color**")
+    h3.markdown("**Label**")
+    
+    for i, rule in enumerate(st.session_state.grade_rules):
+        c1, c2, c3, c4 = st.columns([2, 1, 3, 1])
+        with c1: 
+            rule['cutoff'] = st.number_input(f"Cutoff {i}", value=float(rule['cutoff']), key=f"cut_{i}", label_visibility="collapsed")
+        with c2: 
+            rule['color'] = st.color_picker(f"Color {i}", value=rule['color'], key=f"col_{i}", label_visibility="collapsed")
+        with c3: 
+            rule['label'] = st.text_input(f"Label {i}", value=rule['label'], key=f"lbl_{i}", label_visibility="collapsed")
+        with c4: 
+            if st.button("X", key=f"rem_{i}", help="Remove Rule"):
+                rules_to_remove.append(i)
+
+    # Process removals
+    if rules_to_remove:
+        for i in reversed(rules_to_remove):
+            st.session_state.grade_rules.pop(i)
+        st.rerun()
+
+    # Add new rule button
+    if st.button("➕ Add Threshold"):
+        st.session_state.grade_rules.append({'cutoff': 0.0, 'color': '#808080', 'label': 'New Rule'})
+        st.rerun()
 
 # ==========================================
 # 5. EXECUTION LOGIC
@@ -242,11 +306,16 @@ if st.button("Generate 3D Model", type="primary"):
         # Save Tables
         p_collars = os.path.join(t_dir, "temp_collars.csv")
         p_assays = os.path.join(t_dir, "temp_assays.csv")
+        p_colors = os.path.join(t_dir, "temp_colors.json") # NEW: Color rules file
         p_html = os.path.join(t_dir, "output_model.html")
         p_script = os.path.join(t_dir, "renderer.py")
         
         edited_collars.to_csv(p_collars, index=False)
         edited_assays.to_csv(p_assays, index=False)
+        
+        # Save Color Rules to JSON
+        with open(p_colors, 'w') as f:
+            json.dump(st.session_state.grade_rules, f)
         
         # Save Maps
         p_dem = "None"
@@ -259,11 +328,11 @@ if st.button("Generate 3D Model", type="primary"):
             f.write(RENDER_SCRIPT)
             
         # 3. Execute Worker Script
-        # Command: python renderer.py [dem] [sat] [collars] [assays] [out] [vexag] [buf] [crs]
+        # Command: python renderer.py [dem] [sat] [collars] [assays] [out] [vexag] [buf] [crs] [colors]
         cmd = [
             sys.executable, p_script,
             p_dem, p_sat, p_collars, p_assays, p_html,
-            str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS
+            str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS, p_colors
         ]
         
         try:
