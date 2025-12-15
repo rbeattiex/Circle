@@ -53,20 +53,31 @@ def get_dynamic_color(grade, rules):
 
 def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path):
     # 1. Load Data
-    df_collars = pd.read_csv(collars_path)
+    try:
+        df_collars = pd.read_csv(collars_path)
+    except pd.errors.EmptyDataError:
+        print("Error: Collar CSV is empty")
+        return
+
     df_assays = pd.DataFrame()
     if assays_path and assays_path != 'None':
-        df_assays = pd.read_csv(assays_path)
+        try:
+            df_assays = pd.read_csv(assays_path)
+        except:
+            pass
     
     # Load Color Rules
     color_rules = []
     if os.path.exists(colors_json_path):
         with open(colors_json_path, 'r') as f:
             color_rules = json.load(f)
-    # Sort rules by cutoff descending to ensure correct evaluation order
     color_rules.sort(key=lambda x: x['cutoff'], reverse=True)
     
     # 2. Geometry Prep
+    if df_collars.empty:
+        print("Error: No collar data found")
+        return
+
     CENTER_X = df_collars['X'].mean()
     CENTER_Y = df_collars['Y'].mean()
     
@@ -145,6 +156,10 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
 
     # Traces
     for _, row in df_collars.iterrows():
+        # Skip if missing basic data
+        if pd.isna(row['X']) or pd.isna(row['Y']) or pd.isna(row['Depth']):
+            continue
+
         z_local = avg_elev
         if z_interpolator:
             try: z_local = z_interpolator((row['Y'], row['X']))
@@ -163,10 +178,11 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
         if not df_assays.empty and 'Grade' in df_assays.columns:
             hole_assays = df_assays[df_assays['HoleID'] == row['HoleID']]
             for _, a_row in hole_assays.iterrows():
+                if pd.isna(a_row['From']) or pd.isna(a_row['To']): continue
+                
                 s = get_coords_at_depth(row, a_row['From'], v_exag, CENTER_X, CENTER_Y)
                 e = get_coords_at_depth(row, a_row['To'], v_exag, CENTER_X, CENTER_Y)
                 
-                # Use dynamic color logic
                 c_val = get_dynamic_color(a_row['Grade'], color_rules)
                 plotter.add_mesh(pv.Line(s, e).tube(radius=14), color=c_val)
 
@@ -174,7 +190,6 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
     plotter.export_html(html_out_path)
 
 if __name__ == "__main__":
-    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json
     run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9])
 """
 
@@ -188,26 +203,12 @@ def save_uploaded_file(uploaded_file):
             return tmp_file.name
     except Exception as e: return None
 
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode('utf-8')
-
 # ==========================================
-# 3. DEFAULT DATA
+# 3. EMPTY TEMPLATES
 # ==========================================
-default_collars_dict = {
-    'HoleID': ['DBW-25-001', 'DBW-25-002', 'DBW-25-004R', 'DBW-25-005', 'DBW-25-006', 'DBW-25-009', 'DBW-25-010', 'DBW-25-003', 'DBW-25-007'], 
-    'X': [440375, 440770, 440924, 440435, 440670, 440450, 440300, 440515, 440400], 
-    'Y': [8627810, 8628758, 8628758, 8627812, 8627812, 8627310, 8627310, 8627810, 8627310], 
-    'Azimuth': [90, 270, 270, 90, 270, 270, 90, 90, 270], 
-    'Dip': [-70, -50, -60, -60, -60, -60, -50, -60, -60], 
-    'Depth': [386.00, 218.50, 223.90, 294.20, 200.65, 260.00, 170.10, 166.5, 210.0]
-}
-default_assays_dict = {
-    'HoleID': ['DBW-25-010', 'DBW-25-009', 'DBW-25-009', 'DBW-25-010', 'DBW-25-010', 'DBW-25-009', 'DBW-25-006', 'DBW-25-006', 'DBW-25-006', 'DBW-25-003', 'DBW-25-003', 'DBW-25-007', 'DBW-25-007', 'DBW-25-007'], 
-    'From': [117, 155, 119.75, 45, 101, 178, 142, 159, 167, 19.2, 56.5, 4.0, 52.0, 100.3], 
-    'To': [139, 170, 125, 54, 110, 186, 153, 163, 171, 24.4, 82.4, 20.0, 75.0, 140.0],
-    'Grade': [1.00, 0.98, 0.79, 0.31, 0.32, 0.36, 0.25, 0.18, 0.20, 0.29, 0.48, 0.31, 0.33, 0.51] 
-}
+# No default data. Just structure.
+EMPTY_COLLARS = pd.DataFrame(columns=['HoleID', 'X', 'Y', 'Azimuth', 'Dip', 'Depth'])
+EMPTY_ASSAYS = pd.DataFrame(columns=['HoleID', 'From', 'To', 'Grade'])
 
 # ==========================================
 # 4. MAIN UI
@@ -222,35 +223,44 @@ st.sidebar.header("2. Terrain Upload")
 dem_file = st.sidebar.file_uploader("Upload DEM (.tif)", type=["tif", "tiff"])
 sat_file = st.sidebar.file_uploader("Upload Satellite (.tif)", type=["tif", "tiff"])
 
-st.title("3D Drill Hole Visualizer (Process Isolated)")
-st.info("Using Subprocess Rendering to prevent Async conflicts.")
+st.title("3D Drill Hole Visualizer")
+st.caption("Upload your data or enter it manually below.")
 
 tab_collars, tab_assays, tab_colors = st.tabs(["1. Drill Collars", "2. Assay Intervals", "3. Grade Colours"])
 
 with tab_collars:
     collar_file = st.file_uploader("Upload Collars", type=["csv", "xlsx"], key="c_up")
+    
+    # Logic: Switch between File Data and Empty Template
     if collar_file:
         if collar_file.name.endswith('.csv'): df_collars_in = pd.read_csv(collar_file)
         else: df_collars_in = pd.read_excel(collar_file)
+        c_key = f"c_ed_{collar_file.name}"
     else:
-        df_collars_in = pd.DataFrame(default_collars_dict)
-    edited_collars = st.data_editor(df_collars_in, num_rows="dynamic", key="c_ed", use_container_width=True)
+        df_collars_in = EMPTY_COLLARS
+        c_key = "c_ed_empty"
+        st.info("👋 **No file?** Enter collar data manually below. Required columns: `HoleID`, `X`, `Y`, `Azimuth`, `Dip`, `Depth`")
+
+    edited_collars = st.data_editor(df_collars_in, num_rows="dynamic", key=c_key, use_container_width=True)
 
 with tab_assays:
     assay_file = st.file_uploader("Upload Assays", type=["csv", "xlsx"], key="a_up")
+    
     if assay_file:
         if assay_file.name.endswith('.csv'): df_assays_in = pd.read_csv(assay_file)
         else: df_assays_in = pd.read_excel(assay_file)
+        a_key = f"a_ed_{assay_file.name}"
     else:
-        df_assays_in = pd.DataFrame(default_assays_dict)
-    edited_assays = st.data_editor(df_assays_in, num_rows="dynamic", key="a_ed", use_container_width=True)
+        df_assays_in = EMPTY_ASSAYS
+        a_key = "a_ed_empty"
+        st.info("👋 **No file?** Enter assay data manually below. Required columns: `HoleID`, `From`, `To`, `Grade`")
+
+    edited_assays = st.data_editor(df_assays_in, num_rows="dynamic", key=a_key, use_container_width=True)
 
 # --- TAB 3: DYNAMIC COLORS ---
 with tab_colors:
     st.markdown("#### Grade Thresholds")
-    st.caption("Assays will check these rules from top to bottom. First match wins.")
     
-    # Initialize session state for colors if missing
     if 'grade_rules' not in st.session_state:
         st.session_state.grade_rules = [
             {'cutoff': 0.50, 'color': '#FF0000', 'label': 'High Grade'},  # Red
@@ -259,10 +269,8 @@ with tab_colors:
             {'cutoff': 0.05, 'color': '#008000', 'label': 'Low Grade'}    # Green
         ]
 
-    # Display Rule Editor
     rules_to_remove = []
     
-    # Header
     h1, h2, h3, h4 = st.columns([2, 1, 3, 1])
     h1.markdown("**Grade >=**")
     h2.markdown("**Color**")
@@ -280,13 +288,11 @@ with tab_colors:
             if st.button("X", key=f"rem_{i}", help="Remove Rule"):
                 rules_to_remove.append(i)
 
-    # Process removals
     if rules_to_remove:
         for i in reversed(rules_to_remove):
             st.session_state.grade_rules.pop(i)
         st.rerun()
 
-    # Add new rule button
     if st.button("➕ Add Threshold"):
         st.session_state.grade_rules.append({'cutoff': 0.0, 'color': '#808080', 'label': 'New Rule'})
         st.rerun()
@@ -295,40 +301,35 @@ with tab_colors:
 # 5. EXECUTION LOGIC
 # ==========================================
 if st.button("Generate 3D Model", type="primary"):
+    # Check if table is effectively empty (only headers, no rows)
     if edited_collars.empty:
-        st.error("Collar data required.")
+        st.error("⚠️ **Missing Data:** Please add at least one Drill Collar before generating the model.")
         st.stop()
         
     with st.spinner("Starting isolated render process..."):
-        # 1. Save all inputs to temp files
         t_dir = tempfile.gettempdir()
         
-        # Save Tables
         p_collars = os.path.join(t_dir, "temp_collars.csv")
         p_assays = os.path.join(t_dir, "temp_assays.csv")
-        p_colors = os.path.join(t_dir, "temp_colors.json") # NEW: Color rules file
+        p_colors = os.path.join(t_dir, "temp_colors.json")
         p_html = os.path.join(t_dir, "output_model.html")
         p_script = os.path.join(t_dir, "renderer.py")
         
+        # Save Edited Data
         edited_collars.to_csv(p_collars, index=False)
         edited_assays.to_csv(p_assays, index=False)
         
-        # Save Color Rules to JSON
         with open(p_colors, 'w') as f:
             json.dump(st.session_state.grade_rules, f)
         
-        # Save Maps
         p_dem = "None"
         p_sat = "None"
         if dem_file: p_dem = save_uploaded_file(dem_file)
         if sat_file: p_sat = save_uploaded_file(sat_file)
         
-        # 2. Write the Worker Script
         with open(p_script, "w") as f:
             f.write(RENDER_SCRIPT)
             
-        # 3. Execute Worker Script
-        # Command: python renderer.py [dem] [sat] [collars] [assays] [out] [vexag] [buf] [crs] [colors]
         cmd = [
             sys.executable, p_script,
             p_dem, p_sat, p_collars, p_assays, p_html,
@@ -344,7 +345,7 @@ if st.button("Generate 3D Model", type="primary"):
                 st.download_button("Download HTML", html_content, "model.html")
             else:
                 st.error("Render failed in subprocess.")
-                st.code(result.stderr) # Show the error from the worker
+                st.code(result.stderr)
                 
         except Exception as e:
             st.error(f"System Error: {e}")
