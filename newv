@@ -1,0 +1,200 @@
+def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str, width_exag, min_scale):
+    # Parse Arguments
+    show_grid = (show_grid_str == "True")
+    
+    # Base Sizes (Base radius in meters)
+    BASE_COLLAR_R = 40.0
+    BASE_TRACE_R = 12.0
+    
+    # Apply General Multiplier
+    eff_collar_r = BASE_COLLAR_R * width_exag
+    eff_trace_r = BASE_TRACE_R * width_exag
+    
+    # Apply Mineralization Specific Multiplier
+    eff_assay_r = eff_trace_r * min_scale
+
+    # 1. Load Data
+    try:
+        df_collars = pd.read_csv(collars_path)
+    except pd.errors.EmptyDataError:
+        print("Error: Collar CSV is empty")
+        return
+
+    df_assays = pd.DataFrame()
+    if assays_path and assays_path != 'None':
+        try:
+            df_assays = pd.read_csv(assays_path)
+        except:
+            pass
+    
+    # Load Color Rules
+    color_rules = []
+    if os.path.exists(colors_json_path):
+        with open(colors_json_path, 'r') as f:
+            color_rules = json.load(f)
+    color_rules.sort(key=lambda x: x['cutoff'], reverse=True)
+    
+    # 2. Geometry Prep
+    if df_collars.empty:
+        print("Error: No collar data found")
+        return
+
+    CENTER_X = df_collars['X'].mean()
+    CENTER_Y = df_collars['Y'].mean()
+    
+    terrain_mesh = None
+    terrain_tex = None
+    z_interpolator = None
+    avg_elev = 0.0
+
+    # 3. Terrain Processing
+    if dem_path != 'None' and sat_path != 'None':
+        try:
+            # DEM
+            dem_ds = rioxarray.open_rasterio(dem_path, masked=True).squeeze()
+            if dem_ds.rio.crs is None: dem_ds.rio.write_crs("EPSG:4326", inplace=True)
+            if str(dem_ds.rio.crs) != target_crs:
+                try: dem_ds = dem_ds.rio.reproject(target_crs)
+                except: pass
+
+            # Clip DEM
+            min_x, max_x = df_collars['X'].min() - buffer_sz, df_collars['X'].max() + buffer_sz
+            min_y, max_y = df_collars['Y'].min() - buffer_sz, df_collars['Y'].max() + buffer_sz
+            
+            try: dem_clip = dem_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
+            except: dem_clip = dem_ds
+
+            # SAT
+            sat_ds = rioxarray.open_rasterio(sat_path, masked=True)
+            if sat_ds.rio.crs is None: sat_ds.rio.write_crs("EPSG:4326", inplace=True)
+            if str(sat_ds.rio.crs) != target_crs:
+                try: sat_ds = sat_ds.rio.reproject(target_crs)
+                except: pass
+            
+            try: sat_clip = sat_ds.rio.clip_box(minx=min_x, miny=min_y, maxx=max_x, maxy=max_y)
+            except: sat_clip = sat_ds
+
+            # Texture
+            sat_data = sat_clip.values.transpose(1, 2, 0)
+            if sat_data.dtype != np.uint8:
+                sat_data = ((sat_data - np.nanmin(sat_data)) / (np.nanmax(sat_data) - np.nanmin(sat_data)) * 255).astype(np.uint8)
+            terrain_tex = pv.Texture(sat_data)
+
+            # Mesh
+            x = dem_clip.x.values - CENTER_X
+            y = dem_clip.y.values - CENTER_Y
+            z = dem_clip.values
+            avg_elev = np.nanmean(z)
+            z = np.nan_to_num(z, nan=avg_elev)
+
+            z_interpolator = RegularGridInterpolator(
+                (dem_clip.y.values, dem_clip.x.values), dem_clip.values, 
+                bounds_error=False, fill_value=avg_elev
+            )
+
+            grid = pv.RectilinearGrid(x, y, [0])
+            grid["Elevation"] = z.flatten()
+            grid["Relative_Z"] = (grid["Elevation"] - avg_elev) * v_exag
+            terrain_mesh = grid.warp_by_scalar("Relative_Z")
+            terrain_mesh.texture_map_to_plane(use_bounds=True, inplace=True)
+            
+            dem_ds.close()
+            sat_ds.close()
+
+        except Exception as e:
+            print(f"Terrain Error: {e}")
+            pass
+
+    # 4. Plotting
+    plotter = pv.Plotter(window_size=[800, 600], off_screen=True)
+    plotter.set_background('white')
+
+    if terrain_mesh:
+        plotter.add_mesh(terrain_mesh, texture=terrain_tex, opacity=1.0)
+    else:
+        plane = pv.Plane(center=(0,0,0), i_size=2000, j_size=2000)
+        plotter.add_mesh(plane, color="gray", opacity=0.5, show_edges=True)
+
+    # --- UPDATED: Data Collection for Batch Rendering ---
+    collar_coords = []
+    collar_labels = [] # Stores the "Card" text
+    
+    # Iterate to calculate geometry and trace tubes
+    for _, row in df_collars.iterrows():
+        if pd.isna(row['X']) or pd.isna(row['Y']) or pd.isna(row['Depth']): continue
+
+        # Z Calculation
+        z_local = avg_elev
+        if z_interpolator:
+            try: z_local = z_interpolator((row['Y'], row['X']))
+            except: pass
+        
+        row['Z_rel'] = float((z_local - avg_elev) * v_exag) + 2.0
+        
+        start = get_coords_at_depth(row, 0, v_exag, CENTER_X, CENTER_Y)
+        end = get_coords_at_depth(row, row['Depth'], v_exag, CENTER_X, CENTER_Y)
+        
+        # 1. Collect Collar Info for Batching (The Spheres)
+        collar_coords.append(start)
+        
+        # Create the "Card" content string
+        # Note: HTML newline support varies by viewer, but this formats the data.
+        info_card = (f"Hole ID: {row['HoleID']}\\n"
+                     f"Depth: {row['Depth']}m\\n"
+                     f"Dip: {row['Dip']}\\n"
+                     f"Azimuth: {row['Azimuth']}")
+        collar_labels.append(info_card)
+
+        # 2. Draw Traces (The Tubes) - kept individual for distinct geometry
+        plotter.add_mesh(pv.Line(start, end).tube(radius=eff_trace_r), color="lightgrey", opacity=0.5)
+        
+        # 3. Floating Labels (The Billboard Squares from the image)
+        plotter.add_point_labels(
+            [start + [0,0,120]], 
+            [str(row['HoleID'])], 
+            font_size=16, 
+            text_color="black", 
+            always_visible=True, 
+            shape_opacity=0.5
+        )
+
+        # 4. Assays
+        if not df_assays.empty and 'Grade' in df_assays.columns:
+            hole_assays = df_assays[df_assays['HoleID'] == row['HoleID']]
+            for _, a_row in hole_assays.iterrows():
+                if pd.isna(a_row['From']) or pd.isna(a_row['To']): continue
+                
+                s = get_coords_at_depth(row, a_row['From'], v_exag, CENTER_X, CENTER_Y)
+                e = get_coords_at_depth(row, a_row['To'], v_exag, CENTER_X, CENTER_Y)
+                
+                c_val = get_dynamic_color(a_row['Grade'], color_rules)
+                plotter.add_mesh(pv.Line(s, e).tube(radius=eff_assay_r), color=c_val)
+    
+    # --- UPDATED: Batch Render Collars with Embedded Data ---
+    if collar_coords:
+        # Create a Point Cloud
+        cloud = pv.PolyData(np.array(collar_coords))
+        
+        # Add the data to the mesh (This is what popups read)
+        cloud.point_data["Collar Data"] = np.array(collar_labels)
+        
+        # Create Spheres at every point, copying the data to the spheres
+        # scale=False ensures all spheres are the same size (eff_collar_r)
+        collar_mesh = cloud.glyph(geom=pv.Sphere(radius=eff_collar_r), scale=False)
+        
+        # Add to plotter
+        plotter.add_mesh(collar_mesh, color="black", pickable=True, name="Collars")
+
+    # 5. Add Legend
+    legend_entries = []
+    for rule in color_rules:
+        legend_entries.append((rule['label'], rule['color']))
+    
+    if legend_entries:
+        plotter.add_legend(labels=legend_entries, bcolor='white', size=[0.2, 0.2])
+
+    # 6. Grid
+    if show_grid:
+        plotter.show_grid(xtitle="East", ytitle="North", ztitle="Depth")
+
+    plotter.export_html(html_out_path)
