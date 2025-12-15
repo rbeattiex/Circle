@@ -14,6 +14,7 @@ st.set_page_config(layout="wide", page_title="Drill Hole Visualizer Pro")
 
 # Default Constants
 DEFAULT_V_EXAG = 5
+DEFAULT_WIDTH_EXAG = 1.0 # New Default
 DEFAULT_BUFFER = 1000
 
 # ==========================================
@@ -51,9 +52,18 @@ def get_dynamic_color(grade, rules):
             return rule['color']
     return "lightgray" # Default for low grade
 
-def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str):
-    # Parse Boolean
+def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_exag, buffer_sz, target_crs, colors_json_path, show_grid_str, width_exag):
+    # Parse Arguments
     show_grid = (show_grid_str == "True")
+    
+    # Base Sizes (Base radius in meters)
+    BASE_COLLAR_R = 40.0
+    BASE_TRACE_R = 12.0
+    
+    # Apply Multiplier
+    eff_collar_r = BASE_COLLAR_R * width_exag
+    eff_trace_r = BASE_TRACE_R * width_exag
+    eff_assay_r = eff_trace_r * 1.15  # Assays slightly thicker than trace
 
     # 1. Load Data
     try:
@@ -171,8 +181,8 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
         start = get_coords_at_depth(row, 0, v_exag, CENTER_X, CENTER_Y)
         end = get_coords_at_depth(row, row['Depth'], v_exag, CENTER_X, CENTER_Y)
         
-        plotter.add_mesh(pv.Sphere(radius=40, center=start), color="black")
-        plotter.add_mesh(pv.Line(start, end).tube(radius=12), color="lightgrey", opacity=0.5)
+        plotter.add_mesh(pv.Sphere(radius=eff_collar_r, center=start), color="black")
+        plotter.add_mesh(pv.Line(start, end).tube(radius=eff_trace_r), color="lightgrey", opacity=0.5)
         plotter.add_point_labels([start + [0,0,120]], [str(row['HoleID'])], font_size=16, text_color="black", always_visible=True, shape_opacity=0.5)
 
         # Assays
@@ -185,10 +195,9 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
                 e = get_coords_at_depth(row, a_row['To'], v_exag, CENTER_X, CENTER_Y)
                 
                 c_val = get_dynamic_color(a_row['Grade'], color_rules)
-                plotter.add_mesh(pv.Line(s, e).tube(radius=14), color=c_val)
+                plotter.add_mesh(pv.Line(s, e).tube(radius=eff_assay_r), color=c_val)
     
     # 5. Add Legend
-    # Convert color rules to PyVista legend entries: (Label, Color)
     legend_entries = []
     for rule in color_rules:
         legend_entries.append((rule['label'], rule['color']))
@@ -203,8 +212,8 @@ def run_render(dem_path, sat_path, collars_path, assays_path, html_out_path, v_e
     plotter.export_html(html_out_path)
 
 if __name__ == "__main__":
-    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json, show_grid
-    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9], sys.argv[10])
+    # Args: dem, sat, collars, assays, out_html, vexag, buf, crs, colors_json, show_grid, width_exag
+    run_render(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), sys.argv[8], sys.argv[9], sys.argv[10], float(sys.argv[11]))
 """
 
 # ==========================================
@@ -228,9 +237,11 @@ EMPTY_ASSAYS = pd.DataFrame(columns=['HoleID', 'From', 'To', 'Grade'])
 # ==========================================
 st.sidebar.header("1. Config")
 V_EXAG = st.sidebar.slider("Vertical Exaggeration", 1, 10, DEFAULT_V_EXAG)
+# NEW: Width Exaggeration Slider
+WIDTH_EXAG = st.sidebar.slider("Hole Width Exaggeration", 0.1, 5.0, DEFAULT_WIDTH_EXAG, 0.1)
 BUFFER_SIZE = st.sidebar.number_input("Buffer Size (m)", value=1000)
 TARGET_CRS = st.sidebar.text_input("Project CRS (EPSG Code)", value="EPSG:32735")
-SHOW_GRID = st.sidebar.checkbox("Show Grid & Axes", value=True)  # <-- NEW CHECKBOX
+SHOW_GRID = st.sidebar.checkbox("Show Grid & Axes", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.header("2. Terrain Upload")
@@ -272,14 +283,21 @@ with tab_assays:
 
 # --- TAB 3: DYNAMIC COLORS ---
 with tab_colors:
-    st.markdown("#### Grade Thresholds")
-    
+    c_header, c_btn = st.columns([4, 1])
+    with c_header:
+        st.markdown("#### Grade Thresholds")
+    with c_btn:
+        # NEW: Sort Button
+        if st.button("⬇️ Sort by Grade"):
+            st.session_state.grade_rules.sort(key=lambda x: x['cutoff'], reverse=True)
+            st.rerun()
+
     if 'grade_rules' not in st.session_state:
         st.session_state.grade_rules = [
-            {'cutoff': 0.50, 'color': '#FF0000', 'label': 'High Grade'},  # Red
-            {'cutoff': 0.30, 'color': '#FFA500', 'label': 'Med-High'},    # Orange
-            {'cutoff': 0.15, 'color': '#FFFF00', 'label': 'Med Grade'},   # Yellow
-            {'cutoff': 0.05, 'color': '#008000', 'label': 'Low Grade'}    # Green
+            {'cutoff': 0.50, 'color': '#FF0000', 'label': 'High Grade'},
+            {'cutoff': 0.30, 'color': '#FFA500', 'label': 'Med-High'},
+            {'cutoff': 0.15, 'color': '#FFFF00', 'label': 'Med Grade'},
+            {'cutoff': 0.05, 'color': '#008000', 'label': 'Low Grade'}
         ]
 
     rules_to_remove = []
@@ -341,12 +359,12 @@ if st.button("Generate 3D Model", type="primary"):
         with open(p_script, "w") as f:
             f.write(RENDER_SCRIPT)
             
-        # Passing new argument: SHOW_GRID (True/False as string)
+        # Passing new argument: WIDTH_EXAG
         cmd = [
             sys.executable, p_script,
             p_dem, p_sat, p_collars, p_assays, p_html,
             str(V_EXAG), str(BUFFER_SIZE), TARGET_CRS, p_colors,
-            str(SHOW_GRID)
+            str(SHOW_GRID), str(WIDTH_EXAG)
         ]
         
         try:
